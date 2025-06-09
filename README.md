@@ -130,4 +130,4 @@ Distribuito sotto la licenza MIT. Vedi `LICENSE` per maggiori informazioni.
 
 Salvatore Ucchino - developer.su120188@gmail.com
 
-Link al Progetto: [https://github.com/yourusername/multimodal-ai-assistant](https://github.com/yourusername/multimodal-ai-assistant) 
+Link al Progetto: [https://github.com/devsu88/multimodal-ai-assistant](https://github.com/yourusername/multimodal-ai-assistant) 
