@@ -125,21 +125,26 @@ class ChromaStore:
         try:
             # Cerca nel database usando il filtro sul metadata
             results = self.db.get(
-                where={"source": source}
+                where={"source": source},
+                include=["documents", "metadatas"]
             )
             
             if not results or not results['documents']:
+                logger.warning(f"Nessun risultato trovato per il documento '{source}'")
                 return []
                 
             # Converti i risultati in Document
             documents = []
             for i, doc in enumerate(results['documents']):
                 metadata = results['metadatas'][i] if results['metadatas'] else {}
-                documents.append(Document(
-                    page_content=doc,
-                    metadata=metadata
-                ))
+                # Verifica che il metadata.source corrisponda esattamente al source richiesto
+                if metadata.get('source') == source:
+                    documents.append(Document(
+                        page_content=doc,
+                        metadata=metadata
+                    ))
                 
+            logger.info(f"Trovati {len(documents)} chunk per il documento '{source}'")
             return documents
             
         except Exception as e:

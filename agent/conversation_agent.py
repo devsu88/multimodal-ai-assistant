@@ -1,18 +1,16 @@
 import os
 from langchain.prompts import ChatPromptTemplate
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.output_parsers import StrOutputParser
 from typing import List, Dict, Any, Optional, Union
 import logging
 import json
 from langchain_core.language_models import BaseChatModel
 from langchain_community.vectorstores import Chroma
 from langchain.prompts import ChatPromptTemplate
-from langchain_core.documents import Document
+from pydantic import BaseModel, Field
 
 from vector_db.chroma_store import ChromaStore
 
-from langchain.tools import Tool
+from langchain.tools import Tool, StructuredTool
 from langchain.agents import AgentExecutor, create_structured_chat_agent
 from langchain.agents.structured_chat.output_parser import StructuredChatOutputParser
 from langchain_core.agents import AgentAction, AgentFinish
@@ -20,6 +18,145 @@ from langchain.memory import ConversationBufferMemory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- Constants, Schemas, and Helper Texts ---
+
+AGENT_PROMPT_TEMPLATE = """Sei un assistente AI specializzato nell'analisi di documenti. La tua risposta DEVE essere unicamente un blocco di codice JSON e nient'altro.
+
+Hai accesso ai seguenti strumenti:
+{tools}
+
+I valori validi per il campo "action" nel JSON sono "Final Answer" o uno tra: {tool_names}
+
+---
+ESEMPIO 1:
+Domanda: "c'è qualcosa sull'intelligenza artificiale?"
+```json
+{{
+  "action": "search_document_content",
+  "action_input": {{ "query": "intelligenza artificiale" }}
+}}
+```
+---
+ESEMPIO 2:
+Domanda: "leggimi il file report_annuale.pdf" o "cosa contiene report_annuale.pdf"
+```json
+{{
+  "action": "extract_full_document_text",
+  "action_input": {{ "document_name": "report_annuale.pdf" }}
+}}
+```
+---
+ESEMPIO 3:
+Domanda: "i documenti A e B sono correlati?" o "ci sono collegamenti tra A e B?"
+```json
+{{
+  "action": "analyze_document_correlation",
+  "action_input": {{ 
+    "query": "argomento specifico",  // opzionale
+    "min_correlation": 0.3  // opzionale, default 0.3
+  }}
+}}
+```
+---
+ESEMPIO 4:
+Domanda: "ciao"
+```json
+{{
+  "action": "Final Answer",
+  "action_input": "Ciao! Sono pronto ad aiutarti con i tuoi documenti. Cosa vuoi sapere?"
+}}
+```
+---
+
+REGOLE IMPORTANTI:
+1. Usa "extract_full_document_text" quando l'utente chiede il contenuto di un documento specifico
+2. Usa "search_document_content" solo per cercare informazioni specifiche in tutti i documenti
+3. Usa "analyze_document_correlation" quando l'utente chiede relazioni tra documenti
+   - Puoi specificare una query opzionale per filtrare i risultati
+   - Puoi specificare una soglia di correlazione (default 0.3)
+4. Dopo aver ottenuto i risultati, restituisci sempre una "Final Answer" con il contenuto formattato
+   - IMPORTANTE: per "Final Answer", action_input DEVE essere una stringa, non un dizionario
+   - Esempio corretto: "action_input": "Ecco il contenuto del documento..."
+   - Esempio errato: "action_input": {{ "content": "Ecco il contenuto..." }}
+5. Non entrare in loop di ricerca, usa i risultati trovati per formare la risposta finale
+6. Per domande sulla correlazione tra documenti, usa sempre lo strumento specifico invece di dare risposte generiche
+
+Ora, rispondi alla domanda dell'utente.
+
+Cronologia conversazione:
+{chat_history}
+
+Domanda utente: {input}
+
+Passaggi intermedi (le tue riflessioni e azioni passate):
+{agent_scratchpad}
+"""
+
+SYSTEM_COMMANDS = {"help", "info", "aiuto", "come funziona"}
+
+HELP_MESSAGES = {
+    "welcome": """👋 Benvenuto! Sono il tuo assistente AI specializzato nell'analisi dei documenti.
+
+Posso aiutarti a:
+- 🔍 Cercare informazioni specifiche nei tuoi documenti
+- 📄 Estrarre e leggere il contenuto completo dei documenti
+- 💡 Rispondere a domande dettagliate sul contenuto
+- 📋 Fornire un elenco dei documenti disponibili
+- 📝 Generare riassunti dei documenti
+
+Per iniziare:
+1. Carica almeno un documento usando il pulsante "Carica un documento"
+2. Fammi una domanda sul contenuto
+3. Ti aiuterò a trovare le informazioni che cerchi!
+
+Sono qui per rendere più semplice e veloce l'analisi dei tuoi documenti. Come posso aiutarti oggi? 😊""",
+    "general": """Ciao! Sono il tuo assistente per l'analisi dei documenti. Posso aiutarti a:
+- Cercare informazioni nei documenti
+- Estrarre il testo dai documenti
+- Elencare i documenti disponibili
+- Rispondere a domande sul contenuto dei documenti
+
+Per iniziare, carica almeno un documento e fammi una domanda!""",
+    "system": """Sistema di Analisi Documenti
+- Supporta documenti PDF e immagini
+- Utilizza OCR per estrarre testo dalle immagini
+- Permette ricerche semantiche nel contenuto
+- Mantiene la cronologia delle conversazioni
+
+Per iniziare, carica un documento e fammi una domanda!""",
+    "usage": """Ecco come utilizzare l'assistente:
+
+1. Carica un documento:
+   - Supporta file PDF e immagini
+   - Puoi caricare più documenti
+
+2. Fai domande come:
+   - "Quali documenti sono presenti?"
+   - "Cosa contiene il file X?"
+   - "Cerca informazioni su Y"
+   - "Estrai il testo dal documento Z"
+
+3. Comandi di sistema:
+   - "Aiuto" o "Help" per queste istruzioni
+   - "Info" per informazioni sul sistema
+   - "Come funziona?" per istruzioni d'uso
+
+Ricorda: devi caricare almeno un documento prima di poter fare domande sul contenuto!"""
+}
+
+class EmptyInput(BaseModel):
+    pass
+
+class DocumentSearchInput(BaseModel):
+    query: str = Field(description="La domanda o l'argomento specifico da cercare nei documenti.")
+
+class DocumentExtractInput(BaseModel):
+    document_name: str = Field(description="Il nome del file (o una sua parte univoca) da cui estrarre il testo.")
+
+class DocumentCorrelationInput(BaseModel):
+    query: Optional[str] = Field(default=None, description="Query opzionale per filtrare le correlazioni su un tema specifico")
+    min_correlation: float = Field(default=0.3, description="Soglia minima di correlazione (0-1)")
 
 class CustomOutputParser(StructuredChatOutputParser):
     """Parser personalizzato per gestire risposte in testo libero come Final Answer."""
@@ -61,305 +198,131 @@ class ConversationAgent:
             verbose=True, 
             handle_parsing_errors=True,
             memory=self.memory,
-            max_iterations=5,  # Ridotto a 5 per evitare loop
+            max_iterations=10,  # Ridotto a 5 per evitare loop
             early_stopping_method="force",
             return_intermediate_steps=True  # Aggiunto per debug
         )
 
     def _setup_tools(self) -> List[Tool]:
-        """Definisce gli strumenti che l'agente può utilizzare."""
+        """Definisce e configura gli strumenti che l'agente può utilizzare."""
         return [
-            Tool(
-                name="list_documents",
+            StructuredTool(
+                name="list_available_documents",
                 func=self.list_documents,
-                description="Elenca i documenti presenti nel sistema. Usa questo strumento quando l'utente chiede quali documenti sono disponibili o quanti documenti ci sono."
+                description="Elenca tutti i documenti attualmente disponibili. Usalo quando l'utente chiede quali file ci sono o quanti documenti sono caricati.",
+                args_schema=EmptyInput,
+                handle_tool_error=True
             ),
             Tool(
                 name="search_document_content",
                 func=self.search_documents,
-                description="Cerca informazioni specifiche nei documenti. Usa questo strumento quando l'utente fa domande sul contenuto dei documenti."
+                description="Cerca un'informazione specifica all'interno del contenuto di tutti i documenti disponibili. Usalo per rispondere a domande su argomenti specifici.",
+                args_schema=DocumentSearchInput,
+                handle_tool_error=True
             ),
             Tool(
-                name="extract_document_text",
+                name="extract_full_document_text",
                 func=self.extract_document_text,
-                description="Estrae il testo completo da un documento specifico. Usa questo strumento quando l'utente chiede di leggere il contenuto di un documento."
+                description="Estrae e restituisce il testo completo di un singolo documento specifico. Usalo quando l'utente chiede esplicitamente di leggere o vedere il contenuto di un file.",
+                args_schema=DocumentExtractInput,
+                handle_tool_error=True
+            ),
+            StructuredTool(
+                name="analyze_document_correlation",
+                func=self.analyze_document_correlation,
+                description="Analizza la correlazione tra due documenti specifici. Usalo quando l'utente chiede se ci sono collegamenti o relazioni tra documenti.",
+                args_schema=DocumentCorrelationInput,
+                handle_tool_error=True
             )
         ]
 
     def _setup_prompt(self) -> ChatPromptTemplate:
-        """Crea il prompt per l'agente."""
-        template = """Sei un assistente AI specializzato nell'analisi di documenti. Il tuo compito è rispondere alle domande degli utenti basandoti esclusivamente sui documenti caricati.
-
-REGOLE FONDAMENTALI:
-1. Se non ci sono documenti caricati, informa cortesemente l'utente che è necessario caricarne almeno uno.
-2. Rispondi SOLO basandoti sui documenti disponibili. Non inventare informazioni.
-3. Se la domanda non è pertinente ai documenti, invita l'utente a porre una domanda attinente.
-4. Quando possibile, indica la fonte delle informazioni (nome del documento).
-5. Rispondi in italiano, con tono professionale ma accessibile.
-6. Sii conciso e diretto nelle risposte. Evita di fare troppe riflessioni.
-7. Rispondi SOLO a ciò che viene chiesto, non aggiungere informazioni non richieste.
-
-Strumenti disponibili:
-{tool_names}
-
-Descrizione degli strumenti:
-{tools}
-
-ISTRUZIONI PER L'USO DEGLI STRUMENTI:
-1. Usa 'list_documents' SOLO quando l'utente chiede:
-   - quali documenti sono presenti
-   - quanti documenti ci sono
-   - elenca i documenti
-   - mostra i file disponibili
-
-2. Usa 'search_document_content' SOLO quando l'utente chiede:
-   - informazioni specifiche che potrebbero essere in qualsiasi documento
-   - cerca qualcosa in tutti i documenti
-   - trova informazioni su un argomento specifico
-
-3. Usa 'extract_document_text' SOLO quando l'utente chiede:
-   - il contenuto di un file specifico
-   - cosa contiene un documento particolare
-   - leggi un file specifico
-   - mostra il contenuto di un documento
-
-IMPORTANTE: Scegli SEMPRE lo strumento più appropriato per la domanda specifica dell'utente.
-
-Per usare uno strumento, usa questo formato:
-```json
-{{
-    "action": "nome_strumento",
-    "action_input": "input"
-}}
-```
-
-Per la risposta finale, usa SEMPRE questo formato esatto:
-```json
-{{
-    "action": "Final Answer",
-    "action_input": "La tua risposta qui come stringa semplice"
-}}
-```
-
-IMPORTANTE: La risposta finale DEVE essere una stringa semplice, NON un dizionario o un oggetto JSON.
-
-Cronologia:
-{chat_history}
-
-Domanda: {input}
-
-Riflessioni:
-{agent_scratchpad}
-"""
-        return ChatPromptTemplate.from_template(template)
-
-    def _is_relevant_query(self, query: str) -> bool:
-        """Determina se la query è pertinente ai documenti."""
-        # Parole chiave che indicano una domanda sui documenti
-        document_keywords = [
-            "documento", "documenti", "testo", "contenuto", "cerca", "trova",
-            "cercare", "trovare", "leggi", "leggere", "analizza", "analizzare",
-            "spiega", "spiegare", "descrivi", "descrivere", "riassumi", "riassumere",
-            "cosa dice", "cosa dicono", "cosa contiene", "cosa contengono",
-            "parla di", "parlano di", "tratta di", "trattano di",
-            "informazioni", "dettagli", "particolari", "specifiche",
-            "estrai", "leggi", "mostra", "contenuto", "testo"
-        ]
-        
-        # Parole chiave che indicano una domanda generale
-        general_keywords = [
-            "ciao", "salve", "buongiorno", "buonasera", "come stai",
-            "grazie", "prego", "aiuto", "aiutami", "cosa puoi fare",
-            "funziona", "funzionare", "capire", "capisco", "non capisco"
-        ]
-        
-        query_lower = query.lower()
-        
-        # Se la query contiene parole chiave relative ai documenti, è pertinente
-        if any(keyword in query_lower for keyword in document_keywords):
-            return True
-            
-        # Se la query contiene solo parole chiave generali, non è pertinente
-        if any(keyword in query_lower for keyword in general_keywords):
-            return False
-            
-        # Se non ci sono parole chiave specifiche, assumiamo che sia pertinente
-        return True
-
-    def _analyze_query(self, query: str) -> dict:
-        """Analizza la query usando l'LLM per determinare il tipo e la pertinenza."""
-        # Prepara il contesto della conversazione
-        chat_history = self.memory.chat_memory.messages if self.memory else []
-        context = "\n".join([f"{msg.type}: {msg.content}" for msg in chat_history]) if chat_history else ""
-
-        prompt = f"""Analizza la seguente domanda dell'utente e determina:
-1. Se è una domanda generale (non relativa ai documenti)
-2. Se è pertinente ai documenti
-3. Se è una richiesta di sistema (es. aiuto, informazioni sul sistema)
-4. Se è una domanda di follow-up (continua una conversazione precedente)
-5. Se è una richiesta di riassunto (es. "riassumi", "sintetizza", "in poche parole")
-
-REGOLE PER L'ANALISI:
-- Una domanda è pertinente se:
-  * Chiede di cercare qualcosa nei documenti
-  * Chiede se un argomento è presente nei documenti
-  * Chiede informazioni sul contenuto dei documenti
-  * Chiede di elencare i documenti disponibili
-  * È una domanda di follow-up che continua una ricerca precedente
-  * Chiede un riassunto o una sintesi di un documento
-- Una domanda è generale se:
-  * Non fa riferimento ai documenti
-  * Chiede informazioni generali non relative ai documenti
-  * È un saluto o una conversazione casuale
-- Una domanda è di sistema se:
-  * Chiede aiuto o istruzioni
-  * Chiede informazioni sul sistema
-  * Chiede come funziona l'assistente
-- Una domanda è di riassunto se:
-  * Contiene parole come "riassumi", "sintetizza", "in poche parole"
-  * Chiede un riassunto di un documento
-  * Specifica un limite di parole o caratteri
-
-Esempi di domande pertinenti:
-- "Si parla di calcio nei documenti?"
-- "Cerca informazioni sul calcio"
-- "Quali documenti sono presenti?"
-- "Cosa contiene il file X?"
-- "E di competenze tecniche?" (come follow-up)
-- "Riassumi il documento in 100 parole"
-
-Esempi di domande generali:
-- "Come stai?"
-- "Cosa ne pensi del calcio?"
-- "Qual è il tuo colore preferito?"
-
-Esempi di domande di sistema:
-- "Come funziona?"
-- "Aiuto"
-- "Info"
-
-Esempi di domande di riassunto:
-- "Riassumi il documento"
-- "Sintetizza in 100 parole"
-- "Fammi un riassunto breve"
-
-Cronologia completa della conversazione:
-{context}
-
-Domanda da analizzare: {query}
-
-Rispondi in formato JSON con i seguenti campi:
-{{
-    "is_general": true/false,
-    "is_relevant": true/false,
-    "is_system": true/false,
-    "is_follow_up": true/false,
-    "is_summary": true/false,
-    "word_limit": number/null,
-    "reason": "breve spiegazione della decisione"
-}}"""
-
-        try:
-            response = self.llm.invoke(prompt)
-            # Estrai il JSON dalla risposta
-            json_str = response.content
-            if isinstance(json_str, str):
-                # Rimuovi eventuali markdown o altri caratteri
-                json_str = json_str.replace("```json", "").replace("```", "").strip()
-                return json.loads(json_str)
-            return json_str
-        except Exception as e:
-            logger.error(f"Errore nell'analisi della query: {str(e)}")
-            # In caso di errore, assumiamo che la query sia pertinente
-            return {
-                "is_general": False,
-                "is_relevant": True,
-                "is_system": False,
-                "is_follow_up": False,
-                "is_summary": False,
-                "word_limit": None,
-                "reason": "Errore nell'analisi, default a pertinente"
-            }
+        """Crea il prompt per l'agente usando un template predefinito."""
+        return ChatPromptTemplate.from_template(AGENT_PROMPT_TEMPLATE)
 
     def process_query(self, query: str) -> str:
-        """Elabora una query dell'utente e restituisce una risposta."""
+        """Processa la query dell'utente e restituisce una risposta."""
+        logger.info(f"Inizio elaborazione query: {query}")
+        normalized_query = query.lower().strip()
+
+        # Gestione dei casi preliminari
+        if not self.has_documents():
+            # Se non ci sono documenti, l'agente può solo dare il benvenuto o rispondere a comandi di sistema
+            if normalized_query in SYSTEM_COMMANDS:
+                 return self._handle_system_command(normalized_query)
+            return self._get_welcome_message()
+        
+        # Gestione query di sistema anche quando ci sono documenti
+        if normalized_query in SYSTEM_COMMANDS:
+            return self._handle_system_command(normalized_query)
+
         try:
-            # Verifica se ci sono documenti
-            if not self.has_documents():
-                analysis = self._analyze_query(query)
-                if analysis["is_general"]:
-                    return "Ciao! Sono il tuo assistente per l'analisi dei documenti. Per poterti aiutare, ho bisogno che tu carichi almeno un documento."
-                return "Per poterti aiutare, ho bisogno che tu carichi almeno un documento."
-
-            # Analizza la query
-            analysis = self._analyze_query(query)
+            logger.info("Esecuzione dell'agente principale.")
+            response = self.agent_executor.invoke({
+                "input": query,
+                "chat_history": self.memory.chat_memory.messages if self.memory else []
+            })
             
-            # Gestione query di sistema
-            if analysis["is_system"]:
-                return self._handle_system_query(query)
-
-            # Verifica se la query è pertinente
-            if not analysis["is_relevant"] and not analysis["is_follow_up"]:
-                return "Per rispondere, ho bisogno che la tua domanda sia riferita ai documenti che hai caricato. Vuoi chiedermi qualcosa in merito a essi?"
-
-            # Verifica se è una richiesta di riassunto
-            if analysis["is_summary"]:
-                # Estrai il contenuto del documento
-                content = self.extract_document_text(query)
-                return self._handle_summary_request(query, content)
-
-            # Verifica se è una richiesta di estrazione del testo
-            if any(keyword in query.lower() for keyword in ["estrai", "leggi", "mostra", "contenuto", "testo"]):
-                return self.extract_document_text(query)
-
-            # Elaborazione con l'agente
-            try:
-                # Passa l'intera cronologia della conversazione
-                response = self.agent_executor.invoke({
-                    "input": query,
-                    "chat_history": self.memory.chat_memory.messages if self.memory else []
-                })
-                
-                # Verifica se ci sono stati errori o interruzioni
-                if "Agent stopped" in str(response.get("output", "")):
-                    # Prova un approccio più diretto
-                    return self._handle_direct_query(query)
-                
-                output = response.get("output", "")
-                # Se l'output è un dizionario, estrai la risposta
-                if isinstance(output, dict) and "risposta" in output:
-                    output = output["risposta"]
-                
-                return self._clean_response(output)
-                
-            except Exception as e:
-                logger.error(f"Errore nell'esecuzione dell'agente: {str(e)}")
-                return self._handle_direct_query(query)
+            # Gestione della risposta dell'agente
+            output = response.get("output", "Non ho trovato una risposta.")
             
+            # Se l'output è un dizionario con action_input, estraiamo il contenuto
+            if isinstance(output, dict):
+                if "action_input" in output:
+                    action_input = output["action_input"]
+                    if isinstance(action_input, dict):
+                        if "content" in action_input:
+                            output = action_input["content"]
+                        else:
+                            output = str(action_input)
+                    else:
+                        output = str(action_input)
+                elif "content" in output:
+                    output = output["content"]
+                else:
+                    output = str(output)
+            
+            # Se non è una stringa, la convertiamo
+            if not isinstance(output, str):
+                output = str(output)
+                
+            # Puliamo la risposta
+            cleaned_output = self._clean_response(output)
+            
+            # Se la risposta è il messaggio di benvenuto generico, proviamo a usare l'ultima azione dell'agente
+            if cleaned_output == "Ciao! Sono pronto ad aiutarti con i tuoi documenti. Cosa vuoi sapere?":
+                intermediate_steps = response.get("intermediate_steps", [])
+                if intermediate_steps:
+                    last_step = intermediate_steps[-1]
+                    if isinstance(last_step, tuple) and len(last_step) > 1:
+                        last_output = last_step[1]
+                        if isinstance(last_output, str):
+                            cleaned_output = last_output
+            
+            return cleaned_output
+        
         except Exception as e:
-            logger.error(f"Errore nell'elaborazione della query: {str(e)}", exc_info=True)
-            return "Mi dispiace, si è verificato un errore. Puoi riprovare con una domanda diversa?"
-
-    def _is_general_query(self, query: str) -> bool:
-        """Determina se la query è generale e non richiede documenti."""
-        general_keywords = [
-            "ciao", "salve", "buongiorno", "buonasera", "come stai",
-            "grazie", "prego", "aiuto", "aiutami", "cosa puoi fare",
-            "funziona", "funzionare", "capire", "capisco", "non capisco"
-        ]
-        return any(keyword in query.lower() for keyword in general_keywords)
+            logger.error(f"Errore critico durante l'esecuzione dell'agente: {e}", exc_info=True)
+            return self._handle_direct_query(query)
 
     def _clean_response(self, response: str) -> str:
         """Pulisce la risposta da formattazioni non necessarie."""
         if not response:
             return "Mi dispiace, non sono riuscito a generare una risposta."
         
-        # Rimuovi formattazioni non necessarie
+        # Rimuovi formattazioni non necessarie come i backticks del codice
         response = response.strip()
-        response = response.replace('"', '')
-        response = response.replace('```', '')
+        if response.startswith("```") and response.endswith("```"):
+            response = response[3:-3].strip()
         
-        return response.strip()
+        # Assicuriamoci che la risposta sia una stringa valida
+        if isinstance(response, dict):
+            if "content" in response:
+                response = response["content"]
+            else:
+                response = str(response)
+            
+        return response
 
     def has_documents(self) -> bool:
         """Verifica se ci sono documenti nel database."""
@@ -369,92 +332,33 @@ Rispondi in formato JSON con i seguenti campi:
             logger.error(f"Errore nel conteggio dei documenti: {str(e)}")
             return False
 
-    def _get_general_help(self) -> str:
-        """Fornisce informazioni generali sull'assistente."""
-        return """Ciao! Sono il tuo assistente per l'analisi dei documenti. Posso aiutarti a:
-- Cercare informazioni nei documenti
-- Estrarre il testo dai documenti
-- Elencare i documenti disponibili
-- Rispondere a domande sul contenuto dei documenti
+    def _handle_system_command(self, command: str) -> str:
+        """Gestisce le query di sistema in base a parole chiave."""
+        command = command.lower().strip()
+        if command in ["help", "aiuto", "come funziona"]:
+            return HELP_MESSAGES["usage"]
+        if command == "info":
+            return HELP_MESSAGES["system"]
+        return HELP_MESSAGES["general"]
 
-Per iniziare, carica almeno un documento e fammi una domanda!"""
-
-    def _get_system_info(self) -> str:
-        """Fornisce informazioni sul sistema."""
-        return """Sistema di Analisi Documenti
-- Supporta documenti PDF e immagini
-- Utilizza OCR per estrarre testo dalle immagini
-- Permette ricerche semantiche nel contenuto
-- Mantiene la cronologia delle conversazioni
-
-Per iniziare, carica un documento e fammi una domanda!"""
-
-    def _get_usage_help(self) -> str:
-        """Fornisce istruzioni d'uso dettagliate."""
-        return """Ecco come utilizzare l'assistente:
-
-1. Carica un documento:
-   - Supporta file PDF e immagini
-   - Puoi caricare più documenti
-
-2. Fai domande come:
-   - "Quali documenti sono presenti?"
-   - "Cosa contiene il file X?"
-   - "Cerca informazioni su Y"
-   - "Estrai il testo dal documento Z"
-
-3. Comandi di sistema:
-   - "Aiuto" o "Help" per queste istruzioni
-   - "Info" per informazioni sul sistema
-   - "Come funziona?" per istruzioni d'uso
-
-Ricorda: devi caricare almeno un documento prima di poter fare domande sul contenuto!"""
-
-    def _handle_system_query(self, query: str) -> Optional[str]:
-        """Gestisce le query di sistema."""
-        query = query.lower().strip()
-        
-        # Usa l'LLM per determinare se è una richiesta di aiuto
-        prompt = f"""Determina se questa è una richiesta di aiuto o informazioni sul sistema:
-{query}
-
-Rispondi in formato JSON:
-{{
-    "is_help": true/false,
-    "help_type": "general/system/usage" o null
-}}"""
-
-        try:
-            response = self.llm.invoke(prompt)
-            analysis = json.loads(response.content)
-            
-            if analysis.get("is_help"):
-                help_type = analysis.get("help_type", "general")
-                if help_type == "general":
-                    return self._get_general_help()
-                elif help_type == "system":
-                    return self._get_system_info()
-                elif help_type == "usage":
-                    return self._get_usage_help()
-            
-            return None
-        except Exception as e:
-            logger.error(f"Errore nell'analisi della query di sistema: {str(e)}")
-            return None
-
-    def list_documents(self, _: Optional[str] = None) -> str:
+    def list_documents(self) -> str:
         """Elenca i documenti presenti nel database."""
         try:
+            logger.info("Richiesta di elenco documenti")
             if not self.has_documents():
+                logger.info("Nessun documento presente nel sistema")
                 return "Non ci sono documenti caricati nel sistema."
 
             sources = self.vector_store.get_document_sources()
             num_docs = len(sources)
+            logger.info(f"Trovati {num_docs} documenti nel sistema")
 
             if num_docs == 1:
+                logger.info(f"Documento trovato: {sources[0]}")
                 return f"Attualmente c'è 1 documento nel sistema: {sources[0]}"
             
             doc_list = "\n - ".join(sources)
+            logger.info(f"Documenti trovati: {doc_list}")
             return f"Attualmente ci sono {num_docs} documenti nel sistema:\n - {doc_list}"
             
         except Exception as e:
@@ -464,19 +368,24 @@ Rispondi in formato JSON:
     def search_documents(self, query: str) -> str:
         """Cerca informazioni nei documenti."""
         try:
+            logger.info(f"Richiesta di ricerca con query: {query}")
             if not self.has_documents():
+                logger.warning("Tentativo di ricerca senza documenti disponibili")
                 return "Non ci sono documenti disponibili per la ricerca."
 
             results = self.vector_store.search(query)
+            logger.info(f"Trovati {len(results)} risultati per la query")
             
             if not results:
+                logger.info("Nessun risultato trovato per la query")
                 return "Non ho trovato informazioni pertinenti nei documenti per la tua domanda."
 
             formatted_results = []
             for doc in results:
                 source = doc.metadata.get('source', 'Sconosciuta')
                 content = doc.page_content.strip()
-                formatted_results.append(f"Secondo il documento '{source}':\n{content}")
+                logger.debug(f"Risultato trovato nel documento '{source}'")
+                formatted_results.append(f"Il documento '{source}' contiene:\n{content}")
             
             return "\n\n---\n\n".join(formatted_results)
             
@@ -484,53 +393,34 @@ Rispondi in formato JSON:
             logger.error(f"Errore nella ricerca dei documenti: {str(e)}")
             return "Si è verificato un errore durante la ricerca nei documenti."
 
-    def extract_document_text(self, query: str) -> str:
-        """Estrae il testo da un documento specifico o dall'ultimo caricato."""
+    def extract_document_text(self, document_name: str) -> str:
+        """Estrae il testo da un documento specifico."""
         try:
+            logger.info(f"Richiesta di estrazione testo per il documento: {document_name}")
             if not self.has_documents():
+                logger.warning("Tentativo di estrazione testo senza documenti disponibili")
                 return "Non ci sono documenti disponibili per l'estrazione del testo."
 
-            # Determina quale documento estrarre
-            if "ultimo" in query.lower() or "last" in query.lower():
-                # Estrai dall'ultimo documento
-                sources = self.vector_store.get_document_sources()
-                if not sources:
-                    return "Non ci sono documenti disponibili."
-                target_source = sources[-1]
-            else:
-                # Estrai il nome del file dalla query
-                import re
-                patterns = [
-                    r"file\s+(\S+)",  # "file nome.pdf"
-                    r"documento\s+(\S+)",  # "documento nome.pdf"
-                    r"(\S+\.(pdf|png|jpg|jpeg))",  # "nome.pdf" o "nome.png"
-                    r"(\S+)$"  # ultima parola della query
-                ]
-                
-                target_source = None
-                for pattern in patterns:
-                    match = re.search(pattern, query.lower())
-                    if match:
-                        target_source = match.group(1)
-                        break
-                
-                if not target_source:
-                    return "Non ho capito quale documento vuoi che analizzi. Puoi specificare il nome del file?"
+            target_source = document_name
 
             # Cerca il documento nel database
             sources = self.vector_store.get_document_sources()
             matching_sources = [s for s in sources if target_source.lower() in s.lower()]
             
             if not matching_sources:
+                logger.warning(f"Nessun documento trovato che contenga '{target_source}'")
                 return f"Nessun documento trovato che contenga '{target_source}' nel nome. Documenti disponibili:\n" + "\n".join(f"- {s}" for s in sources)
             
             if len(matching_sources) > 1:
+                logger.warning(f"Trovati {len(matching_sources)} documenti che corrispondono a '{target_source}'")
                 return f"Ho trovato più documenti che corrispondono a '{target_source}':\n" + "\n".join(f"- {s}" for s in matching_sources) + "\n\nPuoi specificare meglio quale documento vuoi analizzare?"
             
             # Estrai il testo dal documento trovato
+            logger.info(f"Estrazione testo dal documento: {matching_sources[0]}")
             results = self.vector_store.search_by_source(matching_sources[0])
             
             if not results:
+                logger.warning(f"Impossibile estrarre il testo dal documento '{matching_sources[0]}'")
                 return f"Non sono riuscito a estrarre il testo dal documento '{matching_sources[0]}'."
 
             # Estrai e formatta il testo
@@ -539,26 +429,141 @@ Rispondi in formato JSON:
                 text_parts.append(doc.page_content.strip())
             
             full_text = "\n\n".join(text_parts)
-            return f"Contenuto del documento '{matching_sources[0]}':\n\n{full_text}"
+            logger.info(f"Testo estratto con successo dal documento '{matching_sources[0]}'")
+            return f"Ecco il contenuto del documento '{matching_sources[0]}':\n\n{full_text}"
             
         except Exception as e:
             logger.error(f"Errore nell'estrazione del testo: {str(e)}")
             return "Si è verificato un errore durante l'estrazione del testo dal documento."
 
+    def analyze_document_correlation(self, query: Optional[str] = None, min_correlation: float = 0.3) -> str:
+        """Analizza le correlazioni tra tutti i documenti disponibili, opzionalmente filtrate per una query specifica."""
+        try:
+            logger.info(f"Analisi correlazioni tra documenti" + (f" per query: {query}" if query else ""))
+            
+            # Ottieni tutti i documenti disponibili
+            sources = self.vector_store.get_document_sources()
+            if not sources:
+                return "Non ci sono documenti disponibili per l'analisi delle correlazioni."
+            
+            # Se c'è una query, filtra prima i documenti
+            if query:
+                results = self.vector_store.search(query)
+                if not results:
+                    return f"Non ho trovato informazioni pertinenti alla query '{query}' nei documenti."
+                doc_results = {}
+                for doc in results:
+                    source = doc.metadata.get('source', 'Sconosciuta')
+                    if source not in doc_results:
+                        doc_results[source] = []
+                    doc_results[source].append(doc.page_content)
+            else:
+                # Se non c'è query, analizza tutti i documenti
+                doc_results = {}
+                for source in sources:
+                    results = self.vector_store.search_by_source(source)
+                    if results:
+                        doc_results[source] = [doc.page_content for doc in results]
+            
+            if len(doc_results) < 2:
+                return "Sono necessari almeno due documenti per analizzare le correlazioni."
+            
+            # Analizza le correlazioni
+            correlations = []
+            
+            # 1. Analisi delle parole chiave comuni
+            doc_keywords = {}
+            for source, contents in doc_results.items():
+                # Estrai parole chiave significative
+                keywords = set()
+                for content in contents:
+                    # Dividi in frasi per un'analisi più precisa
+                    sentences = content.split('.')
+                    for sentence in sentences:
+                        words = sentence.lower().split()
+                        # Filtra parole corte e comuni
+                        keywords.update([w for w in words if len(w) > 3 and w not in {'quale', 'quali', 'quando', 'dove', 'come', 'perché'}])
+                doc_keywords[source] = keywords
+            
+            # 2. Calcola la similarità tra documenti
+            doc_pairs = []
+            for i, (source1, keywords1) in enumerate(doc_keywords.items()):
+                for source2, keywords2 in list(doc_keywords.items())[i+1:]:
+                    # Calcola similarità Jaccard
+                    intersection = len(keywords1.intersection(keywords2))
+                    union = len(keywords1.union(keywords2))
+                    similarity = intersection / union if union > 0 else 0
+                    
+                    if similarity >= min_correlation:
+                        doc_pairs.append((source1, source2, similarity))
+            
+            # 3. Formatta i risultati
+            if doc_pairs:
+                if query:
+                    correlations.append(f"Ho trovato le seguenti correlazioni tra i documenti relativi a '{query}':")
+                else:
+                    correlations.append("Ho trovato le seguenti correlazioni tra i documenti:")
+                
+                # Raggruppa i documenti per livello di correlazione
+                high_corr = []  # > 0.7
+                medium_corr = []  # 0.4-0.7
+                low_corr = []  # 0.3-0.4
+                
+                for source1, source2, similarity in sorted(doc_pairs, key=lambda x: x[2], reverse=True):
+                    similarity_percent = int(similarity * 100)
+                    pair_info = f"- '{source1}' e '{source2}' sono correlati al {similarity_percent}%"
+                    
+                    # Aggiungi dettagli sulle parole chiave comuni
+                    common_keywords = doc_keywords[source1].intersection(doc_keywords[source2])
+                    if common_keywords:
+                        pair_info += f"\n  Parole chiave comuni: {', '.join(list(common_keywords)[:5])}"
+                    
+                    if similarity > 0.7:
+                        high_corr.append(pair_info)
+                    elif similarity > 0.4:
+                        medium_corr.append(pair_info)
+                    else:
+                        low_corr.append(pair_info)
+                
+                # Aggiungi i risultati raggruppati
+                if high_corr:
+                    correlations.append("\nCorrelazioni forti:")
+                    correlations.extend(high_corr)
+                if medium_corr:
+                    correlations.append("\nCorrelazioni moderate:")
+                    correlations.extend(medium_corr)
+                if low_corr:
+                    correlations.append("\nCorrelazioni deboli:")
+                    correlations.extend(low_corr)
+            else:
+                if query:
+                    correlations.append(f"Non ho trovato correlazioni significative tra i documenti per la query '{query}'.")
+                else:
+                    correlations.append("Non ho trovato correlazioni significative tra i documenti disponibili.")
+            
+            return "\n".join(correlations)
+            
+        except Exception as e:
+            logger.error(f"Errore nell'analisi delle correlazioni: {str(e)}")
+            return "Si è verificato un errore durante l'analisi delle correlazioni tra i documenti."
+
     def _handle_direct_query(self, query: str) -> str:
         """Gestisce la query in modo diretto quando l'agente fallisce."""
         try:
+            logger.info(f"Tentativo di gestione diretta della query: {query}")
             # Prova prima con la ricerca diretta
             results = self.vector_store.search(query)
             if results:
+                logger.info(f"Trovati {len(results)} risultati con la ricerca diretta")
                 formatted_results = []
                 for doc in results:
                     source = doc.metadata.get('source', 'Sconosciuta')
                     content = doc.page_content.strip()
-                    formatted_results.append(f"Secondo il documento '{source}':\n{content}")
+                    formatted_results.append(f"Il documento '{source}' contiene:\n{content}")
                 return "\n\n---\n\n".join(formatted_results)
             
             # Se non trova risultati, prova con l'estrazione del testo
+            logger.info("Nessun risultato trovato con la ricerca diretta, tentativo di estrazione testo")
             return self.extract_document_text(query)
             
         except Exception as e:
@@ -567,86 +572,8 @@ Rispondi in formato JSON:
 
     def _get_welcome_message(self) -> str:
         """Restituisce il messaggio di benvenuto dell'agente."""
-        return """👋 Benvenuto! Sono il tuo assistente AI specializzato nell'analisi dei documenti.
-
-Posso aiutarti a:
-- 🔍 Cercare informazioni specifiche nei tuoi documenti
-- 📄 Estrarre e leggere il contenuto completo dei documenti
-- 💡 Rispondere a domande dettagliate sul contenuto
-- 📋 Fornire un elenco dei documenti disponibili
-- 📝 Generare riassunti dei documenti
-
-Per iniziare:
-1. Carica almeno un documento usando il pulsante "Carica un documento"
-2. Fammi una domanda sul contenuto
-3. Ti aiuterò a trovare le informazioni che cerchi!
-
-Sono qui per rendere più semplice e veloce l'analisi dei tuoi documenti. Come posso aiutarti oggi? 😊"""
-
-    def _initialize_agent(self):
-        """Inizializza l'agente con gli strumenti necessari."""
-        # Inizializza la memoria
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
-
-        # Definisci gli strumenti disponibili
-        tools = [
-            Tool(
-                name="search_documents",
-                func=self._search_documents,
-                description="Cerca informazioni nei documenti caricati"
-            ),
-            Tool(
-                name="extract_text",
-                func=self.extract_document_text,
-                description="Estrae e legge il contenuto di un documento"
-            ),
-            Tool(
-                name="list_documents",
-                func=self._list_documents,
-                description="Elenca i documenti disponibili"
-            )
-        ]
-
-        # Crea l'agente
-        self.agent_executor = AgentExecutor.from_agent_and_tools(
-            agent=self._create_agent(tools),
-            tools=tools,
-            memory=self.memory,
-            verbose=True
-        )
+        return HELP_MESSAGES["welcome"]
 
     def get_welcome_message(self) -> str:
         """Restituisce il messaggio di benvenuto."""
-        return self._get_welcome_message()
-
-    def _handle_summary_request(self, query: str, content: str) -> str:
-        """Gestisce una richiesta di riassunto."""
-        try:
-            prompt = f"""Riassumi il seguente testo in modo conciso e chiaro.
-
-Testo da riassumere:
-{content}
-
-Regole per il riassunto:
-1. Cattura SOLO i punti principali
-2. Evita ripetizioni
-3. Usa frasi brevi e dirette
-4. Organizza le informazioni in modo logico
-5. Evita dettagli non essenziali
-6. Non includere esempi o casi specifici
-7. Non ripetere la stessa informazione in modi diversi
-
-Formato del riassunto:
-- Inizia con una frase che introduce l'argomento principale
-- Continua con i punti chiave in ordine di importanza
-- Concludi con una frase riassuntiva"""
-
-            response = self.llm.invoke(prompt)
-            return response.content
-
-        except Exception as e:
-            logger.error(f"Errore nella generazione del riassunto: {str(e)}")
-            return "Mi dispiace, non sono riuscito a generare un riassunto del documento." 
+        return self._get_welcome_message() 

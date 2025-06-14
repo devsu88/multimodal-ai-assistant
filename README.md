@@ -1,133 +1,106 @@
-# Assistente Documentale Multimodale
+# 🤖 Assistente Documenti Multimodale
 
-Un assistente AI in grado di elaborare documenti PDF e immagini, estrarre il testo tramite OCR, e rispondere a domande sul contenuto utilizzando tecniche di RAG (Retrieval Augmented Generation).
+Un assistente AI avanzato in grado di elaborare e analizzare documenti in vari formati, fornendo risposte intelligenti alle domande degli utenti.
 
-## Caratteristiche
+## 🚀 Caratteristiche Principali
 
-- 🖼️ Supporto per PDF e immagini (JPEG/PNG)
-- 📝 Estrazione testo con Tesseract OCR
-- 🔍 Chunking del testo con LangChain
-- 🧮 Embeddings con sentence-transformers
-- 💾 Archiviazione vettoriale con ChromaDB
-- 🤖 Generazione risposte con Ollama
-- 💬 Interfaccia web con Streamlit
+- **Elaborazione Multimodale**: Supporto per documenti PDF, TXT e DOCX
+- **OCR Integrato**: Estrazione del testo da immagini e documenti scansionati
+- **Memoria Conversazionale**: Mantiene il contesto delle conversazioni
+- **Interfaccia Web**: UI intuitiva basata su Streamlit
+- **Base di Conoscenza Vettoriale**: Archiviazione efficiente e ricerca semantica dei documenti
 
-## Requisiti
+## 📋 Prerequisiti
 
-- Python 3.11+
+- Python 3.8+
 - Tesseract OCR
 - Ollama (per il modello LLM locale)
 
-## Installazione
+## 🛠️ Installazione
 
 1. Clona il repository:
 ```bash
-git clone https://github.com/yourusername/multimodal-ai-assistant.git
+git clone https://github.com/tuousername/multimodal-ai-assistant.git
 cd multimodal-ai-assistant
 ```
 
-2. Crea un ambiente virtuale:
-```bash
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# oppure
-.\venv\Scripts\activate  # Windows
-```
-
-3. Installa le dipendenze:
+2. Installa le dipendenze:
 ```bash
 pip install -r requirements.txt
 ```
 
-4. Installa Tesseract OCR:
+3. Installa Tesseract OCR:
 ```bash
 # Ubuntu/Debian
 sudo apt-get install tesseract-ocr
-sudo apt-get install tesseract-ocr-ita  # per il supporto italiano
 
 # macOS
 brew install tesseract
-brew install tesseract-lang  # per le lingue aggiuntive
 
 # Windows
 # Scarica l'installer da https://github.com/UB-Mannheim/tesseract/wiki
 ```
 
-5. Installa Ollama:
+4. Installa e avvia Ollama:
 ```bash
-# Segui le istruzioni su https://ollama.ai/download
+# Segui le istruzioni su https://ollama.ai
 ```
 
-## Configurazione
-
-1. Copia il file di esempio delle variabili d'ambiente:
-```bash
-cp .env.example .env
-```
-
-2. Modifica il file `.env` con le tue configurazioni:
-```
-TESSERACT_CMD=/usr/bin/tesseract  # percorso al comando tesseract
-OLLAMA_MODEL=llama2  # modello Ollama da utilizzare
-```
-
-## Utilizzo
+## 🚀 Avvio
 
 1. Avvia l'applicazione:
 ```bash
-streamlit run ui/app.py
+streamlit run app.py
 ```
 
-2. Apri il browser all'indirizzo indicato (default: http://localhost:8501)
+2. Apri il browser all'indirizzo indicato (solitamente http://localhost:8501)
 
-3. Carica i documenti tramite l'interfaccia web
+## 📁 Struttura del Progetto
 
-4. Inizia a fare domande sul contenuto dei documenti
+```
+multimodal-ai-assistant/
+├── agent/                 # Logica dell'agente conversazionale
+├── chunker/              # Elaborazione e suddivisione dei documenti
+├── ocr/                  # Funzionalità OCR
+├── text_processing/      # Elaborazione del testo
+├── ui/                   # Componenti dell'interfaccia utente
+├── vector_db/           # Gestione del database vettoriale
+├── tests/               # Test unitari e di integrazione
+├── app.py               # Punto di ingresso dell'applicazione
+└── requirements.txt     # Dipendenze del progetto
+```
 
-## Test
+## 💡 Utilizzo
+
+1. Carica un documento utilizzando l'interfaccia web
+2. Attendi l'elaborazione del documento
+3. Inizia a fare domande sul contenuto del documento
+4. L'assistente fornirà risposte basate sul contesto del documento
+
+## 🧪 Test
 
 Esegui i test unitari:
 ```bash
 pytest tests/
 ```
 
-## Struttura del Progetto
+## 🤝 Contribuire
 
-```
-multimodal-ai-assistant/
-├── ocr/
-│   └── extractor.py
-├── chunker/
-│   └── text_splitter.py
-├── vector_db/
-│   └── chroma_store.py
-├── agent/
-│   └── conversation_agent.py
-├── ui/
-│   └── app.py
-├── tests/
-│   ├── test_ocr.py
-│   ├── test_chunker.py
-│   └── test_vector_db.py
-├── requirements.txt
-├── .env.example
-└── README.md
-```
+Le contribuzioni sono benvenute! Per favore:
 
-## Contribuire
-
-1. Fork il repository
+1. Fai un fork del repository
 2. Crea un branch per la tua feature (`git checkout -b feature/AmazingFeature`)
-3. Commit le tue modifiche (`git commit -m 'Add some AmazingFeature'`)
-4. Push al branch (`git push origin feature/AmazingFeature`)
+3. Committa le tue modifiche (`git commit -m 'Add some AmazingFeature'`)
+4. Pusha al branch (`git push origin feature/AmazingFeature`)
 5. Apri una Pull Request
 
-## Licenza
+## 📝 Licenza
 
-Distribuito sotto la licenza MIT. Vedi `LICENSE` per maggiori informazioni.
+Questo progetto è distribuito con licenza MIT. Vedi il file `LICENSE` per maggiori dettagli.
 
-## Contatti
+## 🙏 Ringraziamenti
 
-Salvatore Ucchino - developer.su120188@gmail.com
-
-Link al Progetto: [https://github.com/devsu88/multimodal-ai-assistant](https://github.com/yourusername/multimodal-ai-assistant) 
+- [LangChain](https://github.com/langchain-ai/langchain)
+- [ChromaDB](https://github.com/chroma-core/chroma)
+- [Streamlit](https://streamlit.io)
+- [Ollama](https://ollama.ai) 

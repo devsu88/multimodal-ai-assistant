@@ -35,7 +35,8 @@ logger = logging.getLogger(__name__)
 def init_components() -> Dict[str, Any]:
     """Inizializza e restituisce i componenti principali dell'applicazione come dizionario."""
     try:
-        embedding_model = OllamaEmbeddings(model="qwen2:7b", base_url="http://localhost:11434")
+        embedding_model = OllamaEmbeddings(model="nomic-embed-text:latest", base_url="http://localhost:11434")
+        # llm = ChatOllama(model="llama3-chatqa:8b", temperature=0.1)
         llm = ChatOllama(model="qwen2:7b", temperature=0.1)
         vector_store = ChromaStore(
             persist_directory="chroma_db",
